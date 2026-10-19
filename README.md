@@ -32,7 +32,7 @@ Enter a game title and choose a matching catalog entry. Pixbit then:
 
 Choose a different library folder with:
 
-    py pixbit.py --library "D:\p"
+    py pixbit.py --library "E:\Games\PixbitLibrary"
 
 The default library is %USERPROFILE%\p.
 
