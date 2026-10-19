@@ -10,10 +10,12 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import hashlib
+import json
 import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
@@ -135,8 +137,10 @@ def select_game(entries: list[tuple[str, str]], query: str) -> tuple[str, str]:
 
 def prepare_checkout(title: str, repo_url: str, library: Path) -> Path:
     folder = library / game_folder_name(title, repo_url)
-    checkout = folder
-    if (checkout / ".git").is_dir():
+    checkout = folder / "src"
+    existing = checkout if (checkout / ".git").is_dir() else folder if (folder / ".git").is_dir() else None
+    if existing is not None:
+        checkout = existing
         print(f"[3/5] Existing clone found; reusing it: {checkout}")
         status = subprocess.run(
             ["git", "-C", str(checkout), "submodule", "status", "--recursive"],
@@ -172,7 +176,201 @@ def prepare_checkout(title: str, repo_url: str, library: Path) -> Path:
     return checkout
 
 
+def get_windows_release(repo_url: str) -> dict | None:
+    parsed = urllib.parse.urlparse(repo_url)
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if parsed.netloc.lower() != "github.com" or len(parts) < 2:
+        return None
+    owner, repo = parts[0], parts[1].removesuffix(".git")
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    request = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            release = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+    assets = release.get("assets", [])
+    windows_assets = [
+        asset for asset in assets
+        if re.search(r"windows|win(?:32|64|[-_ ]?x64)", asset.get("name", ""), re.IGNORECASE)
+        and Path(asset.get("name", "")).suffix.lower() in {".zip", ".exe"}
+    ]
+    if not windows_assets:
+        return None
+    # Prefer a ZIP because Windows releases commonly bundle runtime files with the executable.
+    asset = next((a for a in windows_assets if a["name"].lower().endswith(".zip")), windows_assets[0])
+    return {"tag": release.get("tag_name", "latest"), "asset": asset}
+
+
+def download_with_progress(url: str, destination: Path, total_size: int) -> None:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    received = 0
+    with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            output.write(chunk)
+            received += len(chunk)
+            if total_size:
+                percent = min(100, int(received * 100 / total_size))
+                bar = "#" * (percent // 5) + "-" * (20 - percent // 5)
+                print(f"\rDownloading [{bar}] {percent:3d}%", end="", flush=True)
+    print()
+    if total_size and received != total_size:
+        raise RuntimeError(f"Download size mismatch: expected {total_size} bytes, received {received}.")
+
+
+def safe_extract_zip(archive_path: Path, destination: Path) -> None:
+    base = destination.resolve()
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            target = (destination / info.filename).resolve()
+            if target != base and base not in target.parents:
+                raise RuntimeError(f"Unsafe path in release ZIP: {info.filename}")
+        archive.extractall(destination)
+
+
+def find_executable(folder: Path) -> Path | None:
+    candidates = sorted(
+        (path for path in folder.rglob("*.exe") if "uninstall" not in path.name.casefold()),
+        key=lambda path: ("setup" in path.name.casefold(), len(path.parts), path.name.casefold()),
+    )
+    return candidates[0] if candidates else None
+
+
+def install_official_windows_release(title: str, repo_url: str, library: Path) -> Path | None:
+    release = get_windows_release(repo_url)
+    if release is None:
+        print("[i] No latest Windows ZIP/EXE release found; falling back to the source repository.")
+        return None
+
+    folder = library / game_folder_name(title, repo_url)
+    app_dir = folder / "app"
+    existing_exe = find_executable(app_dir) if app_dir.is_dir() else None
+    if existing_exe:
+        print(f"[3/5] Existing official app found; reusing it: {existing_exe}")
+        return existing_exe
+
+    asset = release["asset"]
+    archive_path = folder / asset["name"]
+    print(f"[3/5] Downloading official Windows release {release['tag']} from GitHub...")
+    download_with_progress(asset["browser_download_url"], archive_path, int(asset.get("size", 0)))
+    digest = asset.get("digest", "")
+    if digest.startswith("sha256:"):
+        hasher = hashlib.sha256()
+        with archive_path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                hasher.update(block)
+        if hasher.hexdigest().lower() != digest.split(":", 1)[1].lower():
+            archive_path.unlink(missing_ok=True)
+            raise RuntimeError("GitHub release SHA-256 check failed; the downloaded file was removed.")
+
+    staging = folder / "app-staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    if archive_path.suffix.lower() == ".zip":
+        safe_extract_zip(archive_path, staging)
+    else:
+        shutil.copy2(archive_path, staging / archive_path.name)
+    executable = find_executable(staging)
+    if executable is None:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError("The official release package did not contain a Windows .exe file.")
+    if app_dir.exists():
+        shutil.rmtree(app_dir)
+    staging.rename(app_dir)
+    archive_path.unlink(missing_ok=True)
+    installed = app_dir / executable.relative_to(staging)
+    print(f"[✓] Official app installed: {installed}")
+    return installed
+
+
+def configure_rom_folder_for_app() -> Path | None:
+    folder = configure_rom_folder()
+    if folder:
+        print(f"When the game opens, choose your game file from: {folder}")
+    return folder
+
+
+def launch_choice(executable: Path) -> None:
+    choice = input("Launch now, launch in 10 seconds, or skip? [now/10/skip]: ").strip().lower()
+    if choice in {"now", "n", "yes", "y"}:
+        delay = 0
+    elif choice in {"10", "wait", "later"}:
+        delay = 10
+    else:
+        print("[i] Launch skipped.")
+        return
+    for remaining in range(delay, 0, -1):
+        print(f"Launching in {remaining} seconds... (Ctrl+C to cancel)")
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[i] Launch cancelled.")
+            return
+    subprocess.Popen([str(executable)], cwd=str(executable.parent))
+    print(f"[✓] Launched: {executable}")
+
+
 ROM_EXTENSIONS = {".z64", ".v64", ".n64", ".iso", ".bin", ".wad", ".rom"}
+CONFIG_PATH = Path.home() / ".pixbit" / "config.json"
+
+
+def load_config() -> dict[str, str]:
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(config: dict[str, str]) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+
+def configure_rom_folder() -> Path | None:
+    config = load_config()
+    saved = config.get("rom_folder", "")
+    if saved and Path(saved).is_dir():
+        print(f"[✓] Using saved local game-data folder: {saved}")
+        return Path(saved)
+
+    print("Pixbit can remember a local folder containing your legally obtained game data.")
+    print("It cannot search or download commercial ROMs from ConsoleRoms or similar sites.")
+    value = input("Local ROM folder (Enter to skip): ").strip().strip('"')
+    if not value:
+        return None
+    folder = Path(value).expanduser()
+    if not folder.is_dir():
+        raise RuntimeError(f"ROM folder does not exist: {folder}")
+    config["rom_folder"] = str(folder.resolve())
+    save_config(config)
+    print(f"[✓] Saved game-data folder in {CONFIG_PATH}")
+    return folder
+
+
+def find_game_data(folder: Path, title: str) -> list[Path]:
+    """Find likely local game files by filename, without contacting ROM sites."""
+    words = set(re.findall(r"[a-z0-9]+", title.casefold()))
+    words -= {"the", "a", "an", "native", "port", "decomp", "decompilation", "recomp", "usa", "n64"}
+    if not words:
+        return []
+    found: list[tuple[int, Path]] = []
+    try:
+        for path in folder.rglob("*"):
+            if not path.is_file() or (path.suffix.lower() != ".zip" and path.suffix.lower() not in ROM_EXTENSIONS):
+                continue
+            filename_words = set(re.findall(r"[a-z0-9]+", path.stem.casefold()))
+            overlap = len(words & filename_words)
+            if overlap >= max(2, (len(words) + 1) // 2):
+                found.append((overlap, path))
+    except OSError as exc:
+        raise RuntimeError(f"Could not search local ROM folder {folder}: {exc}") from exc
+    return [path for _, path in sorted(found, key=lambda item: (-item[0], str(item[1]).casefold()))]
 
 
 def _rom_candidates(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
@@ -182,19 +380,30 @@ def _rom_candidates(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
     ]
 
 
-def prepare_user_game_data(checkout: Path) -> None:
-    """Copy a user-provided ROM or extract one from ZIP into the project root."""
+def prepare_user_game_data(checkout: Path, title: str) -> None:
+    """Find a user-provided ROM locally and copy/extract it into the project root."""
     print("[4/5] Game data setup")
-    print("If this project needs a ROM, provide a local copy you are legally entitled to use.")
-    print("Pixbit does not download commercial ROMs. Press Enter to skip this step for now.")
-    source_text = input("Path to your ROM file or ZIP archive: ").strip().strip('"')
-    if not source_text:
+    folder = configure_rom_folder()
+    if folder is None:
         print("[i] Skipped game data setup.")
         return
-
-    source = Path(source_text).expanduser()
-    if not source.is_file():
-        raise RuntimeError(f"Game data file not found: {source}")
+    candidates = find_game_data(folder, title)
+    if not candidates:
+        print(f"[i] No local ROM or ZIP filename matched {title!r} in {folder}.")
+        print("Add your legally obtained game data to that folder and run Pixbit again.")
+        return
+    print("Matching local game-data files:")
+    for index, path in enumerate(candidates[:20], 1):
+        print(f"  {index}. {path}")
+    if len(candidates) == 1:
+        source = candidates[0]
+    else:
+        while True:
+            choice = input(f"Select a file (1-{min(len(candidates), 20)}): ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= min(len(candidates), 20):
+                source = candidates[int(choice) - 1]
+                break
+            print("Enter one of the listed numbers.")
 
     chosen_name = source.name
     if zipfile.is_zipfile(source):
@@ -249,7 +458,7 @@ def main() -> int:
     args = parser.parse_args()
 
     print("Pixbit prototype — local library setup")
-    print("This prototype searches and clones source repositories and can place a user-supplied ROM in the project folder.\n")
+    print("Pixbit prefers official Windows app releases where available, then falls back to source checkouts.\n")
     try:
         ensure_git()
         query = input("Game title to search for: ").strip()
@@ -257,10 +466,18 @@ def main() -> int:
             raise RuntimeError("Enter a game title to search for.")
         entries = fetch_catalog()
         title, repo_url = select_game(entries, query)
-        checkout = prepare_checkout(title, repo_url, args.library.expanduser())
-        prepare_user_game_data(checkout)
-        print(f"\n[5/5] Added to the local Pixbit library: {checkout}")
-        print("Project-specific builds, automatic launch, and Android streaming are not implemented yet.")
+        library = args.library.expanduser()
+        executable = install_official_windows_release(title, repo_url, library)
+        if executable:
+            configure_rom_folder_for_app()
+            launch_choice(executable)
+            print(f"\n[5/5] Ready in the local Pixbit library: {executable.parent}")
+        else:
+            checkout = prepare_checkout(title, repo_url, library)
+            prepare_user_game_data(checkout, title)
+            print(f"\n[5/5] Added source to the local Pixbit library: {checkout}")
+            print("This source-only path still needs a project-specific build recipe before it can make an EXE.")
+        print("Android streaming is not implemented yet.")
         return 0
     except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
         print(f"\n[!] Pixbit stopped: {exc}", file=sys.stderr)
