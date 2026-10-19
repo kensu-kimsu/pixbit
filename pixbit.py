@@ -24,6 +24,7 @@ from shutil import copyfileobj
 
 CATALOG_URL = "https://decomps.samidy.com/"
 USER_AGENT = "Pixbit/0.1 (+https://github.com/kensu-kimsu/pixbit)"
+DEFAULT_LIBRARY = Path(r"D:\Games\Play-decomp\pixbit")
 
 
 class CatalogParser(HTMLParser):
@@ -453,7 +454,7 @@ def prepare_user_game_data(checkout: Path, title: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Pixbit: prototype game catalog and local source library manager")
-    parser.add_argument("--library", type=Path, default=Path.home() / "p",
+    parser.add_argument("--library", type=Path, default=DEFAULT_LIBRARY,
                         help="local folder for supported game projects")
     args = parser.parse_args()
 
