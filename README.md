@@ -34,7 +34,7 @@ Choose a different library folder with:
 
     py pixbit.py --library "E:\Games\PixbitLibrary"
 
-All release downloads, extracted apps, and source checkouts go under D:\\Games\\Play-decomp\\pixbit by default. Use --library to choose another location.\p.
+All release downloads, extracted apps, and source checkouts go under D:\Games\Play-decomp\pixbit by default. Use --library to choose another location.
 
 ### Remembered settings
 
